@@ -7,15 +7,20 @@
 options(repos = c(CRAN = "https://cloud.r-project.org"))
 
 # Keep this list small: data work, survey microdata, StatCan,
-# SQL Server connections, and basic charts.
+# SQL Server connections, API calls, and basic charts.
 mini_packages <- c(
   "data.table",
   "dplyr",
   "tidyr",
+  "purrr",
+  "stringr",
+  "tibble",
   "readr",
   "readxl",
   "janitor",
   "lubridate",
+  "httr2",
+  "jsonlite",
   "survey",
   "srvyr",
   "cansim",
