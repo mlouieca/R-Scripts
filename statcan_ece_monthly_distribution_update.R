@@ -70,22 +70,23 @@ distribution_file_pattern <- env_value(
   "^(ChildCareOcc_ESDC_LFS_Tables_\\d{6}|Monthly Distribution.*)\\.(xlsx|xls)$"
 )
 
-historical_csv_path <- env_value(
-  "ECE_HISTORICAL_CSV",
-  file.path(pipeline_root, "03_Output_PowerBI", "Monthly Historical ECE data.csv")
+powerbi_csv_folder <- env_value(
+  "ECE_POWERBI_CSV_FOLDER",
+  file.path(pipeline_root, "03_Output_PowerBI")
 )
-output_csv_path <- env_value(
-  "ECE_OUTPUT_CSV",
-  file.path(pipeline_root, "03_Output_PowerBI", "Monthly Historical ECE data - full.csv")
+powerbi_combined_csv_path <- env_value(
+  "ECE_POWERBI_COMBINED_CSV",
+  file.path(powerbi_csv_folder, "historical_ece_data_powerbi.csv")
+)
+powerbi_readme_path <- env_value(
+  "ECE_POWERBI_README",
+  file.path(powerbi_csv_folder, "historical_ece_data_powerbi_README.md")
 )
 backup_folder <- env_value(
   "ECE_BACKUP_FOLDER",
   file.path(pipeline_root, "04_Backups")
 )
 
-# Set to TRUE after validating the new full output in Power BI.
-# When TRUE, the script writes back to historical_csv_path and creates a backup first.
-overwrite_historical_file <- env_flag("ECE_OVERWRITE_HISTORICAL_FILE", FALSE)
 backup_existing_file <- env_flag("ECE_BACKUP_EXISTING_FILE", TRUE)
 
 required_packages <- c(
@@ -97,6 +98,8 @@ required_packages <- c(
   "lubridate",
   "tibble"
 )
+
+combined_noc_occupation <- "Combined NOCs: 42202 Early childhood educators and assistants; 44100 Home child care providers"
 
 # ---------------------------------------------------
 # Package check
@@ -199,16 +202,18 @@ rename_to_internal_names <- function(data) {
 
   aliases <- list(
     reference_period = c("reference_period", "Reference Period"),
-    reference_month = c("reference_month", "Reference Month"),
+    reference_month = c("reference_month", "reference_date", "Reference Month"),
     province = c("province", "Province"),
     occupation_5_digit_noc = c(
       "occupation_5_digit_noc",
+      "occupation_5digit_noc",
       "Occupation (5-digit NOC)"
     ),
     variable = c("variable", "Variable"),
-    estimate_rounded = c("estimate_rounded", "Estimate (rounded)"),
+    estimate_rounded = c("estimate_rounded", "estimate", "Estimate (rounded)"),
     coefficient_of_variation_pct = c(
       "coefficient_of_variation_pct",
+      "coefficient_of_variation_percent",
       "Coefficient of variation (%) of estimate"
     ),
     standard_error = c("standard_error", "Standard error of estimate"),
@@ -311,9 +316,9 @@ select_output_columns <- function(data) {
 
 table_definitions <- tribble(
   ~sheet_pattern, ~source_table, ~series_type, ~moving_average_months, ~default_occupation,
-  "^Table 1", "Table 1 - monthly combined N", "Monthly combined NOCs", 1L, "Combined NOCs 42202 and 44100",
-  "^Table 2", "Table 2 - 3MMA separate NOCs", "3MMA separate NOCs", 3L, NA_character_,
-  "^Table 3", "Table 3 - monthly separate N", "Monthly separate NOCs", 1L, NA_character_
+  "^Table 1", "Table 1", "monthly_combined_nocs", 1L, combined_noc_occupation,
+  "^Table 2", "Table 2", "three_month_moving_average_separate_nocs", 3L, NA_character_,
+  "^Table 3", "Table 3", "monthly_separate_nocs", 1L, NA_character_
 )
 
 match_sheet_name <- function(available_sheets, sheet_pattern) {
@@ -410,12 +415,26 @@ read_existing_history <- function(csv_path) {
     add_missing_column("source_file") |>
     add_missing_column("loaded_at") |>
     mutate(
-      source_table = coalesce(source_table, "Table 2 - 3MMA separate NOCs"),
-      series_type = coalesce(series_type, "3MMA separate NOCs"),
-      moving_average_months = coalesce(moving_average_months, "3"),
+      source_table = source_table_id(coalesce(source_table, "Table 2")),
+      moving_average_months = coalesce(
+        moving_average_months,
+        if_else(source_table == "Table 2", "3", "1")
+      ),
       source_file = coalesce(source_file, basename(csv_path)),
       loaded_at = coalesce(loaded_at, NA_character_),
       reference_period = parse_reference_period(reference_period)
+    ) |>
+    mutate(
+      series_type = coalesce(series_type, normalized_series_type(source_table))
+    ) |>
+    mutate(
+      occupation_5_digit_noc = if_else(
+        source_table == "Table 1" &
+          (is.na(occupation_5_digit_noc) |
+             str_detect(occupation_5_digit_noc, regex("^Combined NOCs", ignore_case = TRUE))),
+        combined_noc_occupation,
+        occupation_5_digit_noc
+      )
     ) |>
     mutate(
       reference_month = if_else(
@@ -481,6 +500,191 @@ format_for_power_bi_csv <- function(data) {
   output
 }
 
+source_table_id <- function(source_table) {
+  case_when(
+    str_detect(source_table, regex("^Table 1", ignore_case = TRUE)) ~ "Table 1",
+    str_detect(source_table, regex("^Table 2", ignore_case = TRUE)) ~ "Table 2",
+    str_detect(source_table, regex("^Table 3", ignore_case = TRUE)) ~ "Table 3",
+    TRUE ~ source_table
+  )
+}
+
+source_sheet_name <- function(table_id) {
+  case_when(
+    table_id == "Table 1" ~ "Table 1 - monthly combined N",
+    table_id == "Table 2" ~ "Table 2 - 3MMA separate NOCs",
+    table_id == "Table 3" ~ "Table 3 - monthly separate N",
+    TRUE ~ table_id
+  )
+}
+
+normalized_series_type <- function(table_id) {
+  case_when(
+    table_id == "Table 1" ~ "monthly_combined_nocs",
+    table_id == "Table 2" ~ "three_month_moving_average_separate_nocs",
+    table_id == "Table 3" ~ "monthly_separate_nocs",
+    TRUE ~ str_to_lower(str_replace_all(table_id, "[^A-Za-z0-9]+", "_"))
+  )
+}
+
+normalized_frequency <- function(table_id, moving_average_months) {
+  case_when(
+    table_id == "Table 2" ~ "3MMA",
+    moving_average_months == 3 ~ "3MMA",
+    TRUE ~ "Monthly"
+  )
+}
+
+normalized_noc_detail <- function(table_id) {
+  case_when(
+    table_id == "Table 1" ~ "Combined NOCs",
+    TRUE ~ "Separate NOCs"
+  )
+}
+
+normalized_table_title <- function(table_id) {
+  case_when(
+    table_id == "Table 1" ~ "Table 1: Monthly combined NOCs",
+    table_id == "Table 2" ~ "Table 2: 3MMA separate NOCs",
+    table_id == "Table 3" ~ "Table 3: Monthly separate NOCs",
+    TRUE ~ table_id
+  )
+}
+
+parse_noc_code <- function(occupation) {
+  case_when(
+    str_detect(occupation, "^\\d{5}\\s+") ~ str_extract(occupation, "^\\d{5}"),
+    str_detect(occupation, regex("^Combined NOCs", ignore_case = TRUE)) ~ "42202+44100",
+    TRUE ~ NA_character_
+  )
+}
+
+parse_noc_title <- function(occupation) {
+  case_when(
+    str_detect(occupation, "^\\d{5}\\s+") ~ str_squish(str_remove(occupation, "^\\d{5}\\s+")),
+    str_detect(occupation, regex("^Combined NOCs", ignore_case = TRUE)) ~
+      "Early childhood educators and assistants + Home child care providers",
+    TRUE ~ occupation
+  )
+}
+
+format_for_normalized_power_bi_csv <- function(data) {
+  data |>
+    select_output_columns() |>
+    mutate(
+      source_table = source_table_id(source_table),
+      source_sheet = source_sheet_name(source_table),
+      table_title = normalized_table_title(source_table),
+      series_type = normalized_series_type(source_table),
+      frequency = normalized_frequency(source_table, moving_average_months),
+      noc_detail = normalized_noc_detail(source_table),
+      reference_date = as.character(reference_month),
+      year = reference_period %/% 100,
+      month = reference_period %% 100,
+      occupation_5digit_noc = occupation_5_digit_noc,
+      noc_code = parse_noc_code(occupation_5digit_noc),
+      noc_title = parse_noc_title(occupation_5digit_noc),
+      estimate = estimate_rounded,
+      coefficient_of_variation_percent = coefficient_of_variation_pct,
+      is_suppressed = if_all(
+        c(
+          estimate_rounded,
+          coefficient_of_variation_pct,
+          standard_error,
+          lower_bound_95_ci,
+          upper_bound_95_ci
+        ),
+        is.na
+      )
+    ) |>
+    arrange(
+      reference_period,
+      source_table,
+      province,
+      occupation_5digit_noc,
+      variable
+    ) |>
+    select(
+      source_sheet,
+      source_table,
+      table_title,
+      series_type,
+      frequency,
+      noc_detail,
+      reference_period,
+      reference_date,
+      year,
+      month,
+      province,
+      occupation_5digit_noc,
+      noc_code,
+      noc_title,
+      variable,
+      estimate,
+      coefficient_of_variation_percent,
+      standard_error,
+      lower_bound_95_ci,
+      upper_bound_95_ci,
+      is_suppressed
+    )
+}
+
+write_normalized_power_bi_csvs <- function(data, combined_path, readme_path) {
+  normalized <- format_for_normalized_power_bi_csv(data)
+  output_directory <- dirname(combined_path)
+
+  dir.create(output_directory, recursive = TRUE, showWarnings = FALSE)
+
+  table_outputs <- tribble(
+    ~source_table, ~filename,
+    "Table 1", "historical_ece_table_1_monthly_combined_nocs.csv",
+    "Table 2", "historical_ece_table_2_3mma_separate_nocs.csv",
+    "Table 3", "historical_ece_table_3_monthly_separate_nocs.csv"
+  ) |>
+    mutate(path = file.path(output_directory, filename))
+
+  write_excel_csv(normalized, combined_path, na = "")
+
+  pwalk(
+    table_outputs,
+    function(source_table, filename, path) {
+      normalized |>
+        filter(.data$source_table == source_table) |>
+        write_excel_csv(path, na = "")
+    }
+  )
+
+  readme_lines <- c(
+    "# Historical ECE Data CSV Export",
+    "",
+    "Generated files:",
+    "- historical_ece_data_powerbi.csv: all three workbook tabs in one normalized table.",
+    "- historical_ece_table_1_monthly_combined_nocs.csv: Table 1 only.",
+    "- historical_ece_table_2_3mma_separate_nocs.csv: Table 2 only.",
+    "- historical_ece_table_3_monthly_separate_nocs.csv: Table 3 only.",
+    "",
+    "Power BI notes:",
+    "- Use source_table, series_type, frequency, and noc_detail to keep the tabs logically separate.",
+    "- reference_date is the first day of the source YYYYMM reference period and is ready for date relationships.",
+    "- Numeric measure columns are blank when the source workbook used '.' for suppressed/unavailable values.",
+    "- is_suppressed is TRUE when all numeric measure columns were suppressed/unavailable on the source row.",
+    "",
+    "Columns:",
+    paste0("- ", names(normalized))
+  )
+
+  write_lines(readme_lines, readme_path)
+
+  list(
+    combined_path = combined_path,
+    readme_path = readme_path,
+    table_paths = table_outputs$path,
+    combined_rows = nrow(normalized),
+    table_rows = normalized |>
+      count(source_table, series_type, frequency, noc_detail, name = "rows")
+  )
+}
+
 backup_file <- function(file_path, backup_directory = dirname(file_path)) {
   if (!file.exists(file_path)) {
     return(invisible(NULL))
@@ -500,12 +704,12 @@ backup_file <- function(file_path, backup_directory = dirname(file_path)) {
 
 update_monthly_history <- function(
   distribution_paths,
-  historical_path,
-  output_path,
+  baseline_combined_path,
+  baseline_readme_path,
   backup_directory,
   backup_existing = TRUE
 ) {
-  existing_history <- read_existing_history(historical_path)
+  existing_history <- read_existing_history(baseline_combined_path)
   monthly_distribution <- map_dfr(distribution_paths, read_monthly_distribution)
 
   # Re-running the script will not duplicate existing data. Rows are unique at the
@@ -514,22 +718,28 @@ update_monthly_history <- function(
   updated_history <- bind_rows(existing_history, monthly_distribution) |>
     deduplicate_history()
 
-  if (backup_existing && file.exists(output_path)) {
-    backup_file(output_path, backup_directory)
+  if (backup_existing && file.exists(baseline_combined_path)) {
+    backup_file(baseline_combined_path, backup_directory)
   }
 
-  dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
-
-  write_excel_csv(
-    format_for_power_bi_csv(updated_history),
-    output_path,
-    na = ""
+  normalized_outputs <- write_normalized_power_bi_csvs(
+    updated_history,
+    combined_path = baseline_combined_path,
+    readme_path = baseline_readme_path
   )
 
   list(
     distribution_paths = distribution_paths,
-    historical_path = historical_path,
-    output_path = output_path,
+    baseline_combined_path = normalized_outputs$combined_path,
+    baseline_readme_path = normalized_outputs$readme_path,
+    baseline_table_paths = normalized_outputs$table_paths,
+    baseline_rows = normalized_outputs$combined_rows,
+    baseline_table_rows = normalized_outputs$table_rows,
+    normalized_combined_path = normalized_outputs$combined_path,
+    normalized_readme_path = normalized_outputs$readme_path,
+    normalized_table_paths = normalized_outputs$table_paths,
+    normalized_rows = normalized_outputs$combined_rows,
+    normalized_table_rows = normalized_outputs$table_rows,
     existing_rows = nrow(existing_history),
     monthly_rows = nrow(monthly_distribution),
     output_rows = nrow(updated_history),
@@ -546,16 +756,10 @@ monthly_distribution_paths <- find_distribution_files(
   pattern = distribution_file_pattern
 )
 
-final_output_path <- if (isTRUE(overwrite_historical_file)) {
-  historical_csv_path
-} else {
-  output_csv_path
-}
-
 result <- update_monthly_history(
   distribution_paths = monthly_distribution_paths,
-  historical_path = historical_csv_path,
-  output_path = final_output_path,
+  baseline_combined_path = powerbi_combined_csv_path,
+  baseline_readme_path = powerbi_readme_path,
   backup_directory = backup_folder,
   backup_existing = backup_existing_file
 )
@@ -566,12 +770,33 @@ message("Distribution workbook names:")
 for (path in result$distribution_paths) {
   message("  - ", basename(path))
 }
-message("Historical source: ", result$historical_path)
-message("Output written: ", result$output_path)
+message("Baseline combined CSV overwritten: ", result$baseline_combined_path)
+message("Baseline table CSVs overwritten:")
+for (path in result$baseline_table_paths) {
+  message("  - ", path)
+}
+message("Baseline README written: ", result$baseline_readme_path)
 message("Backup folder: ", backup_folder)
 message("Existing rows read: ", result$existing_rows)
 message("Monthly rows read: ", result$monthly_rows)
 message("Output rows after dedupe: ", result$output_rows)
+message("Baseline output rows: ", result$baseline_rows)
+message("Baseline output rows by source table:")
+for (row_index in seq_len(nrow(result$baseline_table_rows))) {
+  row <- result$baseline_table_rows[row_index, ]
+  message(
+    "  - ",
+    row$source_table,
+    " / ",
+    row$series_type,
+    " / ",
+    row$frequency,
+    " / ",
+    row$noc_detail,
+    ": ",
+    row$rows
+  )
+}
 message(
   "Reference periods loaded from workbook: ",
   paste(result$reference_periods_added, collapse = ", ")
